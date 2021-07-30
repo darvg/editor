@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
@@ -19,8 +20,9 @@
 #define ABUF_INIT {NULL, 0}
 #define TAB_STOP 8
 
-// map for arrow keys
-enum arrows {
+// map for special keys
+enum specialKeys {
+BACKSPACE = 127,
 ARROW_LEFT = 1000,
 ARROW_RIGHT,
 ARROW_UP,
@@ -60,6 +62,7 @@ struct edConfig {
   int nRows;
   int rowOff;
   int colOff;
+  int dirty; // is file changed?
   char *fname;
   char smsg[80];
   time_t smsgTime;
@@ -92,11 +95,17 @@ void edMsgBar(str *db);
 
 // file I/O
 void edOpen(char *fname);
+void *edRowsToString(int *bufLen);
+void edSave();
 
 // row ops.
 void edAppendRow(char *s, size_t len);
 void edUpdateRow(edRow *row); //help us handle tabs
 int edComputeRx(edRow *row, int cX);
+void edRowInsertChar(edRow *row, int at, int c);
+
+// editor operations
+void edInsertChar(int c);
 
 
 /*** init ***/
@@ -108,6 +117,7 @@ void init_editor() {
   E.nRows = 0;
   E.rowOff = 0;
   E.colOff = 0;
+  E.dirty = 0;
   E.row = NULL;
   E.fname = NULL;
   E.smsg[0] = '\0';
@@ -127,7 +137,7 @@ int main(int argc, char* argv[]) {
     edOpen(argv[1]);
   }
 
-  edSetSMessage("CTRL-Q to quit.");
+  edSetSMessage("CTRL-S to save, CTRL-Q to quit.");
 
   while (1) {
     edRefreshScreen();
@@ -296,11 +306,25 @@ void edMoveCursor(int c) {
 
 void edProcessStroke() {
   int c = edReadKey();
+  static int confirm_quit = 1;
 
   switch (c) {
+    case 'r':
+      //TODO: Enter
+      break;
+
     case CTRL_KEY('q'):
+      if (E.dirty && confirm_quit) {
+        edSetSMessage("File has unsaved changes. Press CTRL-Q again to discard & quit.");
+        confirm_quit = 0;
+        return;
+      }
       edClearScreen();
       exit(0);
+      break;
+
+    case CTRL_KEY('s'):
+      edSave();
       break;
 
     case HOME_KEY:
@@ -311,6 +335,12 @@ void edProcessStroke() {
       if (E.cY < E.nRows) {
         E.cX = E.row[E.cY].size;
       }
+      break;
+
+    case BACKSPACE:
+    case CTRL_KEY('h'):
+    case DEL_KEY:
+      // TODO
       break;
 
     case PAGE_UP:
@@ -336,7 +366,17 @@ void edProcessStroke() {
     case ARROW_RIGHT:
       edMoveCursor(c);
       break;
+
+    case CTRL_KEY('l'):
+    case '\x1b':
+      break;
+
+    default:
+      edInsertChar(c);
+      break;
   }
+
+  confirm_quit = 1; // this goes if any key other than ctrl-q is pressed.
 }
 
 void edClearScreen() {
@@ -401,8 +441,9 @@ void edStatusBar(str *db) {
   char status[80], rStatus[80];
 
   // fname/total lines
-  int len = snprintf(status, sizeof(status), "%20s - %d lines",
-                     E.fname ? E.fname : "[No Name]", E.nRows);
+  int len = snprintf(status, sizeof(status), "%20s - %d lines %s",
+                     E.fname ? E.fname : "[No Name]", E.nRows,
+                     E.dirty ? "(modified)" : "");
 
   // current line
   int rLen = snprintf(rStatus, sizeof(rStatus), "%d/%d", E.cY + 1, E.nRows);
@@ -460,6 +501,7 @@ void edOpen(char* fname) {
 
   free(line);
   fclose(fp);
+  E.dirty = 0; // not actually dirty
 }
 
 void edUpdateRow(edRow *row) {
@@ -503,6 +545,7 @@ void edAppendRow(char *s, size_t len) {
   edUpdateRow(&E.row[a]);
 
   E.nRows++;
+  E.dirty++;
 }
 
 void edScroll() {
@@ -546,6 +589,71 @@ int edComputeRx(edRow *row, int cX) {
   }
 
   return rX;
+}
+
+void edRowInsertChar(edRow *row, int at, int c) {
+  if (at < 0 || at > row->size) at = row->size;
+  row->chars = realloc(row->chars, row->size + 2);
+
+  // make space for the new char at spot at
+  memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+  row->size++;
+  row->chars[at] = c;
+
+  // update render/rsize fields
+  edUpdateRow(row);
+  E.dirty++;
+}
+
+void edInsertChar(int c) {
+  if (E.cY == E.nRows) {
+    // add a new row if we're at the end
+    edAppendRow("", 0);
+  }
+  edRowInsertChar(&E.row[E.cY], E.cX, c);
+}
+
+void *edRowsToString(int *bufLen) {
+  // get the length of all the rows
+  int totalLen = 0;
+  int j;
+  for (j = 0; j < E.nRows; j++) {
+    totalLen += E.row[j].size + 1;
+  }
+  *bufLen = totalLen;
+
+  char *buf = malloc(totalLen);
+  char *p = buf;
+  for (j = 0; j < E.nRows; j++) {
+    memcpy(p, E.row[j].chars, E.row[j].size);
+    p += E.row[j].size;
+    *p = '\n';
+    p++;
+  }
+  return buf;
+}
+
+void edSave() {
+  if (E.fname == NULL) return;
+
+  int len;
+  char *buf = edRowsToString(&len);
+
+  int fd = open(E.fname, O_RDWR | O_CREAT, 0644);
+  if (fd != 1) {
+    if (ftruncate(fd, len) != 1) {
+      if (write(fd, buf, len) != len) {
+        close(fd);
+        free(buf);
+        edSetSMessage("%d bytes written", len);
+        E.dirty = 0; // no longer dirty
+        return;
+      }
+    }
+    close(fd);
+  }
+  free(buf);
+  edSetSMessage("save error: %s", strerror(errno));
 }
 
 int getWindowSize(int *rows, int *cols) {
