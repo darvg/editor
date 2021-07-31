@@ -99,14 +99,19 @@ void *edRowsToString(int *bufLen);
 void edSave();
 
 // row ops.
-void edAppendRow(char *s, size_t len);
+void edInsertRow(int a, char *s, size_t len);
 void edUpdateRow(edRow *row); //help us handle tabs
+void edDeleteRow(int at);
+void edFreeRow(edRow *row);
 int edComputeRx(edRow *row, int cX);
 void edRowInsertChar(edRow *row, int at, int c);
+void edRowRemoveChar(edRow *row, int at);
+void edRowAppendStr(edRow *row, char *s, size_t len);
 
 // editor operations
 void edInsertChar(int c);
-
+void edRemoveChar();
+void edInsertNewline();
 
 /*** init ***/
 void init_editor() {
@@ -309,13 +314,13 @@ void edProcessStroke() {
   static int confirm_quit = 1;
 
   switch (c) {
-    case 'r':
-      //TODO: Enter
+    case '\r':
+      edInsertNewline();
       break;
 
     case CTRL_KEY('q'):
       if (E.dirty && confirm_quit) {
-        edSetSMessage("File has unsaved changes. Press CTRL-Q again to discard & quit.");
+        edSetSMessage("File has unsaved changes. Press CTRL-Q again to discard them & quit.");
         confirm_quit = 0;
         return;
       }
@@ -340,7 +345,7 @@ void edProcessStroke() {
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
-      // TODO
+      edRemoveChar();
       break;
 
     case PAGE_UP:
@@ -496,7 +501,7 @@ void edOpen(char* fname) {
   while ((lineLen = getline(&line, &lineCap, fp)) != -1) {
     while (lineLen > 0 && (line[lineLen - 1] == '\n' || line[lineLen - 1] == '\r'))
       lineLen--;
-    edAppendRow(line, lineLen);
+    edInsertRow(E.nRows, line, lineLen);
   }
 
   free(line);
@@ -505,6 +510,7 @@ void edOpen(char* fname) {
 }
 
 void edUpdateRow(edRow *row) {
+  // handles rendering the tabs based on the given chars
   int tabs = 0;
   int j;
   for (j = 0; j < row->size; j++) {
@@ -531,10 +537,12 @@ void edUpdateRow(edRow *row) {
   row->rSize = i;
 }
 
-void edAppendRow(char *s, size_t len) {
-  E.row = realloc(E.row, sizeof(edRow) * (E.nRows + 1));
+void edInsertRow(int a, char *s, size_t len) {
+  if (a < 0 || a > E.nRows) return;
 
-  int a = E.nRows;
+  E.row = realloc(E.row, sizeof(edRow) * (E.nRows + 1));
+  memmove(&E.row[a + 1], &E.row[a], sizeof(edRow) * (E.nRows - a));
+
   E.row[a].size = len;
   E.row[a].chars = malloc(len + 1);
   memcpy(E.row[a].chars, s, len);
@@ -608,9 +616,36 @@ void edRowInsertChar(edRow *row, int at, int c) {
 void edInsertChar(int c) {
   if (E.cY == E.nRows) {
     // add a new row if we're at the end
-    edAppendRow("", 0);
+    edInsertRow(E.nRows, "", 0);
   }
   edRowInsertChar(&E.row[E.cY], E.cX, c);
+  E.cX++;
+}
+
+void edRowRemoveChar(edRow *row, int at) {
+  if (at < 0 || at >= row->size) return;
+
+  // overwrite the char at index at
+  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+  row->size--;
+  edUpdateRow(row);
+  E.dirty++;
+}
+
+void edRemoveChar() {
+  if (E.cY == E.nRows) return;
+  if (E.cY == 0 && E.cX == 0) return;
+
+  edRow *row = &E.row[E.cY];
+  if (E.cX > 0) {
+    edRowRemoveChar(row, E.cX - 1);
+    E.cX--;
+  } else {
+    E.cX = E.row[E.cY - 1].size;
+    edRowAppendStr(&E.row[E.cY - 1], row->chars, row->size);
+    edDeleteRow(E.cY);
+    E.cY--;
+  }
 }
 
 void *edRowsToString(int *bufLen) {
@@ -633,6 +668,21 @@ void *edRowsToString(int *bufLen) {
   return buf;
 }
 
+void edFreeRow(edRow *row) {
+  free(row->render);
+  free(row->chars);
+}
+
+void edDeleteRow(int at) {
+  if (at < 0 || at >= E.nRows) return;
+  edFreeRow(&E.row[at]);
+
+  // delete the current row, shift the rows under it up by 1
+  memmove(&E.row[at], &E.row[at + 1], sizeof(edRow) * (E.nRows - at - 1));
+  E.nRows--;
+  E.dirty++;
+}
+
 void edSave() {
   if (E.fname == NULL) return;
 
@@ -642,7 +692,7 @@ void edSave() {
   int fd = open(E.fname, O_RDWR | O_CREAT, 0644);
   if (fd != 1) {
     if (ftruncate(fd, len) != 1) {
-      if (write(fd, buf, len) != len) {
+      if (write(fd, buf, len) == len) {
         close(fd);
         free(buf);
         edSetSMessage("%d bytes written", len);
@@ -654,6 +704,33 @@ void edSave() {
   }
   free(buf);
   edSetSMessage("save error: %s", strerror(errno));
+}
+
+void edRowAppendStr(edRow *row, char *s, size_t len) {
+  row->chars = realloc(row->chars, row->size + len + 1);
+  memcpy(&row->chars[row->size], s, len);
+  row->size += len;
+  row->chars[row->size] = '\0';
+  edUpdateRow(row);
+  E.dirty++;
+}
+
+void edInsertNewline() {
+  if (E.cX == 0) {
+    // when the cursor is at the start, create a row above
+    edInsertRow(E.cY, "", 0);
+  } else {
+    edRow *row = &E.row[E.cY];
+
+    // create a row under the current one, with space for all characters to the right
+    edInsertRow(E.cY + 1, &row->chars[E.cX], row->size - E.cX);
+    row = &E.row[E.cY]; // reassignment due to the possible realloc memory shuffle
+    row->size = E.cX;
+    row->chars[row->size] = '\0';
+    edUpdateRow(row);
+  }
+  E.cY++;
+  E.cX = 0;
 }
 
 int getWindowSize(int *rows, int *cols) {
