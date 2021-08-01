@@ -20,6 +20,9 @@
 #define ABUF_INIT {NULL, 0}
 #define TAB_STOP 8
 
+#define HL_NUMBERS (1 << 0)
+#define HL_STRINGS (1 << 1)
+
 // map for special keys
 enum specialKeys {
 BACKSPACE = 127,
@@ -32,6 +35,17 @@ END_KEY,
 DEL_KEY,
 PAGE_UP,
 PAGE_DOWN
+};
+
+enum highlightVals {
+HL_NORMAL = 0,
+HL_STRING,
+HL_COMMENT,
+HL_MCOMMENT,
+HL_KEYWORD1,
+HL_KEYWORD2,
+HL_NUMBER,
+HL_SEARCH
 };
 
 
@@ -50,9 +64,22 @@ void dbFree(str *db);
 typedef struct edRow {
   int size;
   int rSize;
+  int rowInd;
+  int hlOpenComment;
   char *render;
   char *chars;
+  unsigned char *hl;
 } edRow;
+
+struct edSyntax {
+  char *fType;
+  char **fMatch;
+  char *commentStartToken;
+  char *mcommentStartToken;
+  char *mcommentEndToken;
+  char **keywords;
+  int flags;
+};
 
 struct edConfig {
   int cX, cY;
@@ -66,11 +93,50 @@ struct edConfig {
   char *fname;
   char smsg[80];
   time_t smsgTime;
+  struct edSyntax *syntax;
   edRow *row;
   struct termios orig_termios;
 };
 struct edConfig E;
 
+
+/*** filetypes ***/
+char *cExts[] = {".c", ".cpp", ".h", NULL};
+char *cKeywords[] = {
+  "switch", "if", "while", "for", "break", "continue", "return", "else",
+  "struct", "union", "typedef", "static", "enum", "class", "case",
+  "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+  "void|", NULL
+};
+
+char *pyExts[] = {".py", NULL};
+char *pyKeywords[] = {
+  "False", "None", "True", "and", "as", "assert", "async", "await",
+  "break", "class", "continue", "def", "del", "elif", "else", "except",
+  "finally", "for", "from", "global", "if", "import", "in", "is", "lambda",
+  "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield", NULL
+};
+
+struct edSyntax HLDB[] = {
+  {
+    "c",
+    cExts,
+    "//", "/*", "*/",
+    cKeywords,
+    HL_NUMBERS | HL_STRINGS
+  },
+  
+  {
+    "python",
+    pyExts,
+    "#", "\"\"\"", "\"\"\"",
+    pyKeywords,
+    HL_NUMBERS | HL_STRINGS
+  }
+  
+};
+
+#define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
 /*** func headers ***/
 // terminal headers
@@ -119,6 +185,13 @@ void edInsertNewline();
 void edSearch();
 void edSearchCallback(char *q, int k);
 
+// syntax highlighting
+void edUpdateHL(edRow *row);
+int edSyntaxToColor(int hl);
+void edChooseHL();
+int isSep(int c);
+
+
 /*** init ***/
 void init_editor() {
   // init x,y coords of cursor w.r.t. terminal
@@ -131,6 +204,7 @@ void init_editor() {
   E.dirty = 0;
   E.row = NULL;
   E.fname = NULL;
+  E.syntax = NULL;
   E.smsg[0] = '\0';
   E.smsgTime = 0;
 
@@ -439,7 +513,43 @@ void edDrawRows(str *db) {
       if (len > E.sCols) len = E.sCols; // user can't go past EOF
 
       // cutoff the starting part of the string that shouldn't be shown.
-      dbAppend(db, &E.row[fRow].render[E.colOff], len);
+      char *preColor = &E.row[fRow].render[E.colOff];
+      unsigned char *hl = &E.row[fRow].hl[E.colOff];
+      int currColor = -1; // the default, i.e. white-on-black
+      for (int j = 0; j < len; j++) {
+        if (iscntrl(preColor[j])) {
+          // represent unprintable characters
+          char sym = (preColor[j] <= 26) ? '@' + preColor[j] : '?';
+          dbAppend(db, "\x1b[7m", 4);
+          dbAppend(db, &sym, 1);
+          dbAppend(db, "\x1b[m", 3);
+          if (currColor != -1) {
+            // restore previous highlighting scheme
+            char buf[16];
+            int cLen = snprintf(buf, sizeof(buf), "\x1b[%dm", currColor);
+            dbAppend(db, buf, cLen);
+          }
+        } else if (hl[j] == HL_NORMAL) {
+          if (currColor != -1) {
+            // set current color back to default
+            dbAppend(db, "\x1b[39m", 5);
+            currColor = -1;
+          }
+          dbAppend(db, &preColor[j], 1);
+        } else {
+          int c = edSyntaxToColor(hl[j]);
+          if (c != currColor) {
+            // set current color to new color
+            currColor = c;
+            char buf[16];
+            int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", c);
+            dbAppend(db, buf, clen);
+          }
+          dbAppend(db, &preColor[j], 1);
+        }
+      }
+      // make sure default is back for subsequent rows
+      dbAppend(db, "\x1b[39m", 5);
     }
 
     // erase as we go
@@ -461,7 +571,8 @@ void edStatusBar(str *db) {
                      E.dirty ? "(modified)" : "");
 
   // current line
-  int rLen = snprintf(rStatus, sizeof(rStatus), "%d/%d", E.cY + 1, E.nRows);
+  int rLen = snprintf(rStatus, sizeof(rStatus), "%s | %d/%d",
+                      E.syntax ? E.syntax->fType : "no ft", E.cY + 1, E.nRows);
 
   if (len > E.sCols) len = E.sCols;
   dbAppend(db, status, len);
@@ -505,6 +616,8 @@ void edOpen(char* fname) {
   FILE* fp = fopen(fname, "r");
   if (!fp) error_exit("fopen");
 
+  edChooseHL();
+
   char* line = NULL;
   size_t lineCap = 0;
   ssize_t lineLen;
@@ -545,6 +658,8 @@ void edUpdateRow(edRow *row) {
 
   row->render[i] = '\0';
   row->rSize = i;
+
+  edUpdateHL(row);
 }
 
 void edInsertRow(int a, char *s, size_t len) {
@@ -553,6 +668,9 @@ void edInsertRow(int a, char *s, size_t len) {
   E.row = realloc(E.row, sizeof(edRow) * (E.nRows + 1));
   memmove(&E.row[a + 1], &E.row[a], sizeof(edRow) * (E.nRows - a));
 
+  // update each displaced row
+  for (int j = a + 1; j <= E.nRows; j++) E.row[j].rowInd++;
+
   E.row[a].size = len;
   E.row[a].chars = malloc(len + 1);
   memcpy(E.row[a].chars, s, len);
@@ -560,6 +678,10 @@ void edInsertRow(int a, char *s, size_t len) {
 
   E.row[a].rSize = 0;
   E.row[a].render = NULL;
+  E.row[a].hl = NULL;
+
+  E.row[a].rowInd = a;
+  E.row[a].hlOpenComment = 0;
   edUpdateRow(&E.row[a]);
 
   E.nRows++;
@@ -694,6 +816,7 @@ void *edRowsToString(int *bufLen) {
 void edFreeRow(edRow *row) {
   free(row->render);
   free(row->chars);
+  free(row->hl);
 }
 
 void edDeleteRow(int at) {
@@ -702,6 +825,9 @@ void edDeleteRow(int at) {
 
   // delete the current row, shift the rows under it up by 1
   memmove(&E.row[at], &E.row[at + 1], sizeof(edRow) * (E.nRows - at - 1));
+
+  // update each displaced row
+  for (int j = at; j < E.nRows - 1; j++) E.row[j].rowInd--;
   E.nRows--;
   E.dirty++;
 }
@@ -713,6 +839,7 @@ void edSave() {
       edSetSMessage("Save aborted.");
       return;
     }
+    edChooseHL();
   }
 
   int len;
@@ -811,6 +938,17 @@ void edSearchCallback(char *q, int k) {
   static int prevMatch = -1;
   static int direction = 1; // 1 for forward, -1 for backward
 
+  static int savedHLLine;
+  static char *savedHL = NULL;
+
+  // undo the highlighting for a search query
+  // guaranteed to be called since we use this function when leaving search mode
+  if (savedHL) {
+    memcpy(E.row[savedHLLine].hl, savedHL, E.row[savedHLLine].rSize);
+    free(savedHL);
+    savedHL = NULL;
+  }
+
   // set up variables for moving through search results
   if (k == '\r' || k == '\x1b') {
     prevMatch = -1;
@@ -843,6 +981,11 @@ void edSearchCallback(char *q, int k) {
       E.cY = current;
       E.cX = edComputeCx(row, match - row->render);
       E.rowOff = E.nRows;
+
+      savedHLLine = current;
+      savedHL = malloc(row->rSize);
+      memcpy(savedHL, row->hl, row->rSize);
+      memset(&row->hl[match - row->render], HL_SEARCH, strlen(q));
       break;
     }
   }
@@ -864,6 +1007,185 @@ void edSearch() {
     E.cY = cY_t;
     E.colOff = colOff_t;
     E.rowOff = rowOff_t;
+  }
+}
+
+int isSep(int c) {
+  return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
+}
+
+int edSyntaxToColor(int hl) {
+  switch(hl) {
+    case HL_NUMBER: return 31;
+    case HL_KEYWORD1: return 33;
+    case HL_KEYWORD2: return 32;
+    case HL_SEARCH: return 34;
+    case HL_STRING: return 35;
+    case HL_COMMENT:
+    case HL_MCOMMENT: return 90;
+    default: return 37;
+  }
+}
+
+void edUpdateHL(edRow *row) {
+  row->hl = realloc(row->hl, row->rSize);
+  memset(row->hl, HL_NORMAL, row->rSize);
+
+  if (E.syntax == NULL) return;
+
+  char **keywords = E.syntax->keywords;
+
+  // comment tokens
+  char *cst = E.syntax->commentStartToken;
+  char *mcst = E.syntax->mcommentStartToken;
+  char *mcet = E.syntax->mcommentEndToken;
+
+  // comment token lens
+  int cstLen = cst ? strlen(cst) : 0;
+  int mcstLen = mcst ? strlen(mcst) : 0;
+  int mcetLen = mcet ? strlen(mcet) : 0;
+
+  int prevSep = 1;
+  int inStr = 0;
+  int inComment = (row->rowInd > 0 && E.row[row->rowInd - 1].hlOpenComment);
+
+  int i = 0;
+  while (i < row->rSize) {
+    char c = row->render[i];
+    unsigned char prevHL = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+    // hl single-line comments
+    if (cstLen && !inStr && !inComment) {
+      if (!strncmp(&row->render[i], cst, cstLen)) {
+        memset(&row->hl[i], HL_COMMENT, row->rSize - i);
+        break;
+      }
+    }
+
+    // hl multi-line comments
+    if (mcstLen && mcetLen && !inStr) {
+      if (inComment) {
+        // if we're in a multiline comment, then we can safely highlight
+        row->hl[i] = HL_MCOMMENT;
+        if (!strncmp(&row->render[i], mcet, mcetLen)) {
+          memset(&row->hl[i], HL_MCOMMENT, mcetLen);
+          i += mcetLen;
+          inComment = 0;
+          prevSep = 1;
+          continue;
+        } else {
+          i++;
+          continue;
+        }
+      } else if (!strncmp(&row->render[i], mcst, mcstLen)) {
+        // check if the current token is the start of a multiline comment
+        memset(&row->hl[i], HL_MCOMMENT, mcstLen);
+        i += mcstLen;
+        inComment = 1;
+        continue;
+      }
+    }
+
+    // hl strings
+    if (E.syntax->flags & HL_STRINGS) {
+      if (inStr) {
+        row->hl[i] = HL_STRING;
+        if (c == '\\' && i + 1 < row->rSize) {
+          // handling escaped quotes
+          row->hl[i + 1] = HL_STRING;
+          i += 2;
+          continue;
+        }
+        if (c == inStr) inStr = 0; // once we see another "/', we exit string mode
+        i++;
+        prevSep = 1;
+        continue;
+      } else {
+        // if we see a " or ', we assume we're in a string.
+        if (c == '"' || c == '\'') {
+          inStr = c;
+          row->hl[i] = HL_STRING;
+          i++;
+          continue;
+        }
+      }
+    }
+
+    // make sure we need to highlight numbers for this file
+    if (E.syntax->flags & HL_NUMBERS) {
+      // prev. char must be num. or sep. for curr. num. to be highlighted
+      // second case handles decimals
+      if((isdigit(c) && (prevSep || prevHL == HL_NUMBER)) ||
+         (c == '.' && prevHL == HL_NUMBER)) {
+        row->hl[i] = HL_NUMBER;
+
+        // we're in the middle of highlighting a sequence, so we increment/continue
+        i++;
+        prevSep = 0;
+        continue;
+      }
+    }
+
+    // hl keywords
+    if (prevSep) {
+      int j;
+      for (j = 0; keywords[j]; j++) {
+        int kLen = strlen(keywords[j]);
+        int kw2 = keywords[j][kLen - 1] == '|';
+        if (kw2) kLen--;
+
+        if (!strncmp(&row->render[i], keywords[j], kLen) &&
+            isSep(row->render[i + kLen])) {
+          memset(&row->hl[i], kw2 ? HL_KEYWORD2 : HL_KEYWORD1, kLen);
+          i += kLen;
+          break;
+        }
+      }
+
+      if (keywords[j] == NULL) {
+        prevSep = 0;
+        continue;
+      }
+    }
+
+    prevSep = isSep(c);
+    i++;
+  }
+
+  // check if we're still in a ml comment or not
+  int changed = (row->hlOpenComment != inComment);
+  row->hlOpenComment = inComment;
+
+  // if we are not, change the highlighting of the next line
+  if (changed && row->rowInd + 1 < E.nRows)
+    edUpdateHL(&E.row[row->rowInd + 1]);
+}
+
+void edChooseHL() {
+  E.syntax = NULL;
+  if (E.fname == NULL) return;
+
+  char *ext = strrchr(E.fname, '.');
+
+  // figure out which highlighting scheme to use based on HLDB
+  for (unsigned int j = 0; j < HLDB_ENTRIES; j++) {
+    struct edSyntax *s = &HLDB[j];
+    unsigned int i = 0;
+    while (s->fMatch[i]) {
+      int isExt = (s->fMatch[i][0] == '.');
+      if ((isExt && ext && !strcmp(ext, s->fMatch[i])) ||
+          (!isExt && strstr(E.fname, s->fMatch[i]))) {
+        E.syntax = s;
+
+        // change the higlighting when the ftype changes
+        int fRow;
+        for (fRow = 0; fRow < E.nRows; fRow++) {
+          edUpdateHL(&E.row[fRow]);
+        }
+        return;
+      }
+      i++;
+    }
   }
 }
 
